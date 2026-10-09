@@ -291,7 +291,8 @@ public class MainActivity extends Activity {
 
     private static boolean validPhone(String s) {
         String d = digits(s);
-        return d.length() >= 10 && d.length() <= 11 && d.startsWith("0");
+        if (d.startsWith("010")) return d.length() == 11;
+        return d.length() >= 10 && d.length() <= 11 && d.startsWith("01");
     }
 
     // ------------------------------------------------------------------ main list
@@ -393,6 +394,7 @@ public class MainActivity extends Activity {
                 times.addView(t);
             }
             who.addView(times);
+            who.setOnClickListener(v -> editStudent(s, this::render));
             row.addView(who, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
             Button b;
@@ -479,7 +481,7 @@ public class MainActivity extends Activity {
             ArrayList<PendingIntent> sent = new ArrayList<>();
             for (int i = 0; i < parts.size(); i++) {
                 if (i == 0) {
-                    Intent it = new Intent(ACTION_SENT).setPackage(getPackageName()).putExtra("name", name);
+                    Intent it = new Intent(ACTION_SENT).setPackage(getPackageName()).putExtra("name", name + "(" + prettyPhone(phone) + ")");
                     sent.add(PendingIntent.getBroadcast(this, requestCode++, it,
                             PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
                 } else {
