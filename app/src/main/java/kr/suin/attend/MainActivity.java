@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.PendingIntent;
+import android.app.TimePickerDialog;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -415,29 +416,40 @@ public class MainActivity extends Activity {
         summaryTv.setText((filter.isEmpty() ? "" : "총 " + all.size() + "명 중 ") + (filter.isEmpty() ? "총 " : filter + " ") + list.size() + "명" + "   등원 " + nIn + "   하원 " + nOut + "   미등원 " + (list.size() - nIn));
     }
 
+    /** 등원/하원 버튼: 시간을 고르는 창(기본값 = 지금)을 띄우고, 확인하면 기록 + 문자 */
     private void check(JSONObject s, String kind) {
         if (!isToday()) return;
-        boolean confirm = sp.getBoolean("confirm", false);
-        Runnable go = () -> doCheck(s, kind);
-        if (confirm) {
-            new AlertDialog.Builder(this)
-                    .setTitle(s.optString("name") + " " + ("in".equals(kind) ? "등원" : "하원"))
-                    .setMessage(fill(s, kind, now()))
-                    .setPositiveButton("보내기", (d, w) -> go.run())
-                    .setNegativeButton("취소", null)
-                    .show();
-        } else {
-            go.run();
-        }
+        pickTime(s.optString("name") + " " + ("in".equals(kind) ? "등원" : "하원") + " 시간", now(), time -> {
+            if (sp.getBoolean("confirm", false)) {
+                new AlertDialog.Builder(this)
+                        .setTitle(s.optString("name") + " " + ("in".equals(kind) ? "등원" : "하원"))
+                        .setMessage(fill(s, kind, time))
+                        .setPositiveButton("보내기", (d, w) -> doCheck(s, kind, time))
+                        .setNegativeButton("취소", null)
+                        .show();
+            } else {
+                doCheck(s, kind, time);
+            }
+        });
     }
 
-    private void doCheck(JSONObject s, String kind) {
+    interface TimeChosen { void on(String hhmm); }
+
+    private void pickTime(String title, String initial, TimeChosen done) {
+        int h = 0, m = 0;
+        try { h = Integer.parseInt(initial.substring(0, 2)); m = Integer.parseInt(initial.substring(3, 5)); } catch (Exception ignored) { }
+        TimePickerDialog dlg = new TimePickerDialog(this, (view, hour, minute) ->
+                done.on(String.format(Locale.KOREA, "%02d:%02d", hour, minute)), h, m, true);
+        dlg.setTitle(title);
+        dlg.show();
+    }
+
+    private void doCheck(JSONObject s, String kind, String time) {
         if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
-            pendingAfterPermission = () -> doCheck(s, kind);
+            pendingAfterPermission = () -> doCheck(s, kind, time);
             requestPermissions(new String[]{Manifest.permission.SEND_SMS}, REQ_SMS);
             return;
         }
-        String time = now();
         JSONObject rec = record();
         try {
             JSONObject e = rec.optJSONObject(s.optString("id"));
@@ -495,9 +507,9 @@ public class MainActivity extends Activity {
     private void confirmUndo(JSONObject s, String kind) {
         String what = "in".equals(kind) ? "등원" : "하원";
         new AlertDialog.Builder(this)
-                .setTitle(s.optString("name") + " " + what + " 기록 지우기")
+                .setTitle(s.optString("name") + " " + what + " 기록")
                 .setMessage(("in".equals(kind) ? "등원을 지우면 하원 기록도 함께 지워져요. " : "") + "이미 보낸 문자는 취소되지 않아요.")
-                .setPositiveButton("지우기", (d, w) -> {
+                .setPositiveButton("기록 지우기", (d, w) -> {
                     JSONObject rec = record();
                     JSONObject e = rec.optJSONObject(s.optString("id"));
                     if (e != null) {
@@ -507,6 +519,19 @@ public class MainActivity extends Activity {
                         saveRecord(rec);
                     }
                     render();
+                })
+                .setNeutralButton("시간만 고치기", (d, w) -> {
+                    JSONObject rec0 = record();
+                    JSONObject e0 = rec0.optJSONObject(s.optString("id"));
+                    String cur = e0 == null ? now() : e0.optString(kind, now());
+                    pickTime(s.optString("name") + " " + what + " 시간 고치기 (문자는 안 보내요)", cur, time -> {
+                        JSONObject rec = record();
+                        JSONObject e = rec.optJSONObject(s.optString("id"));
+                        if (e == null) e = new JSONObject();
+                        try { e.put(kind, time); rec.put(s.optString("id"), e); } catch (JSONException ignored) { }
+                        saveRecord(rec);
+                        render();
+                    });
                 })
                 .setNegativeButton("그대로 두기", null)
                 .show();
