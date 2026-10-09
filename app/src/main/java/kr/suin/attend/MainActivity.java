@@ -23,6 +23,7 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -66,6 +67,7 @@ public class MainActivity extends Activity {
     private LinearLayout listBox;
     private TextView dateTv;
     private TextView summaryTv;
+    private LinearLayout classBar;
     private Runnable pendingAfterPermission;
     private int requestCode = 100;
 
@@ -196,6 +198,13 @@ public class MainActivity extends Activity {
         summaryTv.setPadding(0, 0, 0, dp(10));
         root.addView(summaryTv);
 
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        classBar = new LinearLayout(this);
+        classBar.setPadding(0, 0, 0, dp(10));
+        hs.addView(classBar);
+        root.addView(hs);
+
         ScrollView scroll = new ScrollView(this);
         listBox = new LinearLayout(this);
         listBox.setOrientation(LinearLayout.VERTICAL);
@@ -221,7 +230,10 @@ public class MainActivity extends Activity {
             JSONArray a = new JSONArray(sp.getString("students", "[]"));
             for (int i = 0; i < a.length(); i++) out.add(a.getJSONObject(i));
         } catch (JSONException ignored) { }
-        Collections.sort(out, (x, y) -> x.optString("name").compareTo(y.optString("name")));
+        Collections.sort(out, (x, y) -> {
+            int c = classKey(x).compareTo(classKey(y));
+            return c != 0 ? c : x.optString("name").compareTo(y.optString("name"));
+        });
         return out;
     }
 
@@ -254,6 +266,20 @@ public class MainActivity extends Activity {
         return s;
     }
 
+    private static String classKey(JSONObject s) {
+        String c = s.optString("cls", "").trim();
+        return c.isEmpty() ? "\uFFFF" : c;   // students without a class go last
+    }
+
+    private List<String> classNames(List<JSONObject> list) {
+        List<String> out = new ArrayList<>();
+        for (JSONObject o : list) {
+            String c = o.optString("cls", "").trim();
+            if (!c.isEmpty() && !out.contains(c)) out.add(c);
+        }
+        return out;
+    }
+
     /** "예봉중학교 2학년" */
     private static String schoolInfo(JSONObject s) {
         String school = s.optString("school", "").trim();
@@ -275,10 +301,36 @@ public class MainActivity extends Activity {
         dateTv.setText((day.get(Calendar.MONTH) + 1) + "월 " + day.get(Calendar.DAY_OF_MONTH) + "일 ("
                 + week[day.get(Calendar.DAY_OF_WEEK) - 1] + ")" + (isToday() ? "  오늘" : ""));
 
-        List<JSONObject> list = students();
+        List<JSONObject> all = students();
         JSONObject rec = record();
         int nIn = 0, nOut = 0;
         listBox.removeAllViews();
+
+        // class tabs
+        List<String> classes = classNames(all);
+        String filter = sp.getString("filter", "");
+        if (!filter.isEmpty() && !classes.contains(filter)) filter = "";
+        classBar.removeAllViews();
+        if (!classes.isEmpty()) {
+            List<String> tabs = new ArrayList<>();
+            tabs.add("");
+            tabs.addAll(classes);
+            for (String c : tabs) {
+                boolean on = c.equals(filter);
+                int cnt = 0;
+                for (JSONObject o : all) if (c.isEmpty() || c.equals(o.optString("cls", "").trim())) cnt++;
+                Button chip = button((c.isEmpty() ? "전체" : c) + " " + cnt, on ? INK : Color.WHITE, on ? Color.WHITE : INK);
+                chip.setTextSize(14);
+                chip.setMinWidth(dp(56));
+                chip.setPadding(dp(14), dp(6), dp(14), dp(6));
+                chip.setOnClickListener(v -> { sp.edit().putString("filter", c).apply(); render(); });
+                LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
+                cp.rightMargin = dp(6);
+                classBar.addView(chip, cp);
+            }
+        }
+        List<JSONObject> list = new ArrayList<>();
+        for (JSONObject o : all) if (filter.isEmpty() || filter.equals(o.optString("cls", "").trim())) list.add(o);
 
         if (list.isEmpty()) {
             summaryTv.setText("");
@@ -298,7 +350,17 @@ public class MainActivity extends Activity {
             listBox.addView(note);
         }
 
+        String lastClass = null;
         for (JSONObject s : list) {
+            String cls = s.optString("cls", "").trim();
+            if (filter.isEmpty() && !classes.isEmpty() && !cls.equals(lastClass)) {
+                int cnt = 0;
+                for (JSONObject o : list) if (cls.equals(o.optString("cls", "").trim())) cnt++;
+                TextView h = text((cls.isEmpty() ? "반 없음" : cls) + " · " + cnt + "명", 14, MUTED, true);
+                h.setPadding(dp(2), dp(lastClass == null ? 0 : 10), 0, dp(6));
+                listBox.addView(h);
+                lastClass = cls;
+            }
             final String id = s.optString("id");
             JSONObject e = rec.optJSONObject(id);
             final String tin = e == null ? "" : e.optString("in", "");
@@ -350,7 +412,7 @@ public class MainActivity extends Activity {
             rp.bottomMargin = dp(8);
             listBox.addView(row, rp);
         }
-        summaryTv.setText("전체 " + list.size() + "   등원 " + nIn + "   하원 " + nOut + "   미등원 " + (list.size() - nIn));
+        summaryTv.setText((filter.isEmpty() ? "" : "총 " + all.size() + "명 중 ") + (filter.isEmpty() ? "총 " : filter + " ") + list.size() + "명" + "   등원 " + nIn + "   하원 " + nOut + "   미등원 " + (list.size() - nIn));
     }
 
     private void check(JSONObject s, String kind) {
@@ -470,11 +532,13 @@ public class MainActivity extends Activity {
         EditText sphone = input("학생 전화번호 (선택)", InputType.TYPE_CLASS_PHONE);
         EditText school = input("학교 (선택, 예: 예봉중학교)", InputType.TYPE_CLASS_TEXT);
         EditText grade = input("학년 (선택, 예: 2)", InputType.TYPE_CLASS_NUMBER);
+        EditText clsIn = input("반 (선택, 예: 공수1반)", InputType.TYPE_CLASS_TEXT);
         v.addView(name);
         v.addView(phone);
         v.addView(sphone);
         v.addView(school);
         v.addView(grade);
+        v.addView(clsIn);
         Button add = button("추가", INK, Color.WHITE);
         v.addView(add, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
         Button bulk = button("여러 명 한 번에 넣기", Color.WHITE, INK);
@@ -500,7 +564,8 @@ public class MainActivity extends Activity {
                 for (JSONObject s : list) {
                     String info = schoolInfo(s);
                     String sp2 = s.optString("studentPhone", "");
-                    TextView t = text(s.optString("name") + (info.isEmpty() ? "" : "  (" + info + ")")
+                    String c2 = s.optString("cls", "").trim();
+                    TextView t = text((c2.isEmpty() ? "" : "[" + c2 + "] ") + s.optString("name") + (info.isEmpty() ? "" : "  (" + info + ")")
                             + "\n학부모 " + prettyPhone(s.optString("phone"))
                             + (sp2.isEmpty() ? "" : "   학생 " + prettyPhone(sp2)), 15, INK, false);
                     t.setPadding(0, dp(10), 0, dp(10));
@@ -518,7 +583,7 @@ public class MainActivity extends Activity {
             String spv = sphone.getText().toString();
             if (n.isEmpty() || !validPhone(p)) { toast("이름과 학부모 전화번호(010-0000-0000)를 확인해 주세요"); return; }
             if (!spv.trim().isEmpty() && !validPhone(spv)) { toast("학생 전화번호를 확인해 주세요"); return; }
-            addStudent(n, p, spv, school.getText().toString().trim(), grade.getText().toString().trim());
+            addStudent(n, p, spv, school.getText().toString().trim(), grade.getText().toString().trim(), clsIn.getText().toString().trim());
             name.setText(""); phone.setText(""); sphone.setText(""); school.setText(""); grade.setText("");
             name.requestFocus();
             refresh.run();
@@ -529,7 +594,7 @@ public class MainActivity extends Activity {
         dlg.show();
     }
 
-    private void addStudent(String name, String phone, String studentPhone, String school, String grade) {
+    private void addStudent(String name, String phone, String studentPhone, String school, String grade, String cls) {
         List<JSONObject> list = students();
         try {
             JSONObject o = new JSONObject();
@@ -539,6 +604,7 @@ public class MainActivity extends Activity {
             o.put("studentPhone", validPhone(studentPhone) ? prettyPhone(studentPhone) : "");
             o.put("school", school == null ? "" : school);
             o.put("grade", grade == null ? "" : grade.replace("학년", "").trim());
+            o.put("cls", cls == null ? "" : cls.trim());
             list.add(o);
         } catch (JSONException ignored) { }
         saveStudents(list);
@@ -548,8 +614,9 @@ public class MainActivity extends Activity {
      * 한 줄 = 한 명. 이름이 맨 앞, 나머지는 순서 상관없이:
      * 첫 번째 전화번호 = 학부모, 두 번째 = 학생, "~학교"/"~중"/"~고"/"~초" = 학교, 숫자 1~6 또는 "2학년" = 학년.
      * 예) 김지나 010-1234-5678 010-2345-6789 예봉중학교 3
+     * 번호 없이 반 이름만 있는 줄(예: "[공수1반]" 또는 "공수1반")은 그 아래 학생들의 반이 된다.
      */
-    private boolean addFromLine(String line) {
+    private boolean addFromLine(String line, String cls) {
         String[] tok = line.trim().split("[\\s,\\t]+");
         if (tok.length < 2) return false;
         String name = tok[0];
@@ -572,12 +639,12 @@ public class MainActivity extends Activity {
         }
         if (phoneBuf.length() >= 10) phones.add(phoneBuf.toString());
         if (phones.isEmpty() || !validPhone(phones.get(0))) return false;
-        addStudent(name, phones.get(0), phones.size() > 1 ? phones.get(1) : "", school, grade);
+        addStudent(name, phones.get(0), phones.size() > 1 ? phones.get(1) : "", school, grade, cls);
         return true;
     }
 
     private void showBulk(Runnable after) {
-        EditText e = input("한 줄에 한 명씩:\n이름 학부모번호 학생번호 학교 학년\n김지나 010-1234-5678 010-2345-6789 예봉중학교 3\n(학생번호·학교·학년은 빼도 돼요)", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        EditText e = input("[반 이름] 줄 아래에 한 줄에 한 명씩:\n[공수1반]\n이름 학부모번호 학생번호 학교 학년\n김지나 010-1234-5678 010-2345-6789 예봉중학교 3\n(반·학생번호·학교·학년은 빼도 돼요)", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         e.setMinLines(6);
         e.setGravity(Gravity.TOP);
         LinearLayout wrap = new LinearLayout(this);
@@ -588,10 +655,13 @@ public class MainActivity extends Activity {
                 .setView(wrap)
                 .setPositiveButton("모두 추가", (d, w) -> {
                     int ok = 0, bad = 0;
+                    String cls = "";
                     for (String line : e.getText().toString().split("\n")) {
                         line = line.trim();
                         if (line.isEmpty()) continue;
-                        if (addFromLine(line)) ok++;
+                        String bare = line.replaceAll("^\\[|\\]$", "").trim();
+                        if (!bare.matches(".*\\d{3}.*") && !bare.contains(" ") && (line.startsWith("[") || bare.endsWith("반"))) { cls = bare; continue; }
+                        if (addFromLine(line, cls)) ok++;
                         else bad++;
                     }
                     toast(ok + "명 추가했어요" + (bad > 0 ? " (형식이 맞지 않는 " + bad + "줄은 건너뜀)" : ""));
@@ -616,11 +686,14 @@ public class MainActivity extends Activity {
         school.setText(s.optString("school", ""));
         EditText grade = input("학년 (선택)", InputType.TYPE_CLASS_NUMBER);
         grade.setText(s.optString("grade", ""));
+        EditText clsIn = input("반 (선택)", InputType.TYPE_CLASS_TEXT);
+        clsIn.setText(s.optString("cls", ""));
         v.addView(name);
         v.addView(phone);
         v.addView(sphone);
         v.addView(school);
         v.addView(grade);
+        v.addView(clsIn);
         new AlertDialog.Builder(this)
                 .setTitle("학생 정보 수정")
                 .setView(v)
@@ -639,6 +712,7 @@ public class MainActivity extends Activity {
                                 o.put("studentPhone", validPhone(spv) ? prettyPhone(spv) : "");
                                 o.put("school", school.getText().toString().trim());
                                 o.put("grade", grade.getText().toString().replace("학년", "").trim());
+                                o.put("cls", clsIn.getText().toString().trim());
                             } catch (JSONException ignored) { }
                         }
                     }
