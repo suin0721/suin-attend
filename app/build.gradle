@@ -10,12 +10,27 @@ android {
         applicationId "kr.suin.attend"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        // every GitHub build gets a higher number so the phone accepts it as an update
+        versionCode((System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger())
+        versionName "1." + (System.getenv("GITHUB_RUN_NUMBER") ?: "0")
+    }
+
+    // one fixed signing key for every build; a different key per build makes Android refuse the update
+    signingConfigs {
+        shared {
+            storeFile file("suin.keystore")
+            storePassword "suinattend"
+            keyAlias "suin"
+            keyPassword "suinattend"
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig signingConfigs.shared
+        }
         release {
+            signingConfig signingConfigs.shared
             minifyEnabled false
         }
     }
