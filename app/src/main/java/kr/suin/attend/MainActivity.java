@@ -96,6 +96,7 @@ public class MainActivity extends Activity {
     private DatabaseReference dayRef;
     private ValueEventListener dayListener;
     private boolean studentsLoaded = false;
+    private String loadError = null;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private int requestCode = 100;
 
@@ -175,10 +176,14 @@ public class MainActivity extends Activity {
                 }
                 boolean first = !studentsLoaded;
                 studentsLoaded = true;
-                if (first) migrateLocalData();
+                loadError = null;
+                if (first && studentCache.isEmpty()) migrateLocalData(false);
                 render();
             }
-            @Override public void onCancelled(DatabaseError e) { toast("학생 목록을 불러오지 못했어요: " + e.getMessage()); }
+            @Override public void onCancelled(DatabaseError e) {
+                loadError = "공용 저장소를 읽을 권한이 없어요.\nFirebase → Realtime Database → 규칙에 안내받은 규칙을 붙여넣고 '게시'했는지 확인해 주세요.\n(" + e.getMessage() + ")";
+                render();
+            }
         });
         Cloud.root().child("settings").addValueEventListener(new ValueEventListener() {
             @Override public void onDataChange(DataSnapshot snap) { settingsCache = Cloud.toJson(snap.getValue()); }
@@ -202,21 +207,24 @@ public class MainActivity extends Activity {
         dayRef.addValueEventListener(dayListener);
     }
 
-    /** 처음 로그인했을 때 이 폰에만 있던 학생·출결 기록을 Firebase 로 한 번 올린다 */
-    private void migrateLocalData() {
-        if (sp.getBoolean("migrated", false)) return;
-        sp.edit().putBoolean("migrated", true).apply();
-        if (!studentCache.isEmpty()) return;
+    /** 이 폰에만 있던 학생·출결 기록(예전 버전)을 Firebase 로 올린다. 이미 있는 학생·기록은 건드리지 않는다. */
+    private void migrateLocalData(boolean force) {
+        if (!force && sp.getBoolean("migratedOk", false)) return;
         try {
             JSONArray a = new JSONArray(sp.getString("students", "[]"));
-            if (a.length() == 0) return;
+            if (a.length() == 0) { if (force) toast("이 폰에 남아 있는 예전 기록이 없어요"); return; }
+            Set<String> have = new HashSet<>();
+            for (JSONObject c : studentCache) have.add(c.optString("id"));
             Map<String, Object> up = new HashMap<>();
+            int n = 0;
             for (int i = 0; i < a.length(); i++) {
                 JSONObject o = a.getJSONObject(i);
                 String id = o.optString("id");
+                if (id.isEmpty() || have.contains(id)) continue;
                 JSONObject copy = new JSONObject(o.toString());
                 copy.remove("id");
                 up.put("students/" + id, Cloud.toFirebase(copy));
+                n++;
             }
             for (String k : sp.getAll().keySet()) {
                 if (!k.startsWith("rec_")) continue;
@@ -224,13 +232,25 @@ public class MainActivity extends Activity {
                 Iterator<String> it = rec.keys();
                 while (it.hasNext()) {
                     String sid = it.next();
-                    up.put("days/" + k.substring(4) + "/" + sid, Cloud.toFirebase(rec.get(sid)));
+                    JSONObject e = rec.optJSONObject(sid);
+                    if (e == null) continue;
+                    Iterator<String> kt = e.keys();
+                    while (kt.hasNext()) {
+                        String kind = kt.next();
+                        // per-field paths: an existing cloud time for the same student/day is only replaced by the phone's own record
+                        up.put("days/" + k.substring(4) + "/" + sid + "/" + kind, e.optString(kind));
+                    }
                 }
             }
             if (sp.contains("tplIn")) up.put("settings/tplIn", sp.getString("tplIn", DEFAULT_IN));
             if (sp.contains("tplOut")) up.put("settings/tplOut", sp.getString("tplOut", DEFAULT_OUT));
-            Cloud.root().updateChildren(up);
-            toast("이 폰에 있던 학생 " + a.length() + "명과 출결 기록을 올렸어요");
+            final int count = n;
+            Cloud.root().updateChildren(up)
+                    .addOnSuccessListener(r -> {
+                        sp.edit().putBoolean("migratedOk", true).apply();
+                        toast("이 폰에 있던 학생 " + count + "명과 출결 기록을 올렸어요");
+                    })
+                    .addOnFailureListener(err -> toast("예전 기록을 올리지 못했어요. Firebase 규칙(게시)을 확인해 주세요."));
         } catch (JSONException ignored) { }
     }
 
@@ -526,6 +546,13 @@ public class MainActivity extends Activity {
         List<JSONObject> list = new ArrayList<>();
         for (JSONObject o : all) if (filter.isEmpty() || filter.equals(o.optString("cls", "").trim())) list.add(o);
 
+        if (loadError != null) {
+            summaryTv.setText("");
+            TextView err = text(loadError, 15, 0xFFC0392B, false);
+            err.setPadding(dp(8), dp(40), dp(8), dp(12));
+            listBox.addView(err);
+            return;
+        }
         if (list.isEmpty()) {
             summaryTv.setText("");
             TextView empty = text("아직 등록된 학생이 없어요.\n오른쪽 위 '학생'을 눌러 이름과 학부모 번호를 넣어 주세요.", 15, MUTED, false);
@@ -992,6 +1019,9 @@ public class MainActivity extends Activity {
         TextView acct = text("로그인: " + me, 12, MUTED, false);
         acct.setPadding(0, dp(10), 0, 0);
         v.addView(acct);
+        Button reup = button("폰에 남은 예전 기록 올리기", Color.WHITE, INK);
+        reup.setOnClickListener(x -> migrateLocalData(true));
+        v.addView(reup, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)));
         Button logout = button("로그아웃", Color.WHITE, INK);
         logout.setOnClickListener(x -> {
             disableGateway();
