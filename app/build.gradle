@@ -1,10 +1,11 @@
 plugins {
     id 'com.android.application'
+    id 'com.google.gms.google-services'
 }
 
 android {
     namespace 'kr.suin.attend'
-    compileSdk 34
+    compileSdk 35
 
     defaultConfig {
         applicationId "kr.suin.attend"
@@ -39,4 +40,10 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+dependencies {
+    implementation platform('com.google.firebase:firebase-bom:33.7.0')
+    implementation 'com.google.firebase:firebase-database'
+    implementation 'com.google.firebase:firebase-auth'
 }

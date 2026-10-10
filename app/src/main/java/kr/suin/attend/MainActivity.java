@@ -30,6 +30,19 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.google.firebase.auth.FirebaseAuth;
+import com.google.firebase.database.DataSnapshot;
+import com.google.firebase.database.DatabaseError;
+import com.google.firebase.database.DatabaseReference;
+import com.google.firebase.database.ServerValue;
+import com.google.firebase.database.ValueEventListener;
+
+import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.provider.Settings;
+
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -38,13 +51,19 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 
 /**
- * 수인T 출결: 등원/하원 버튼을 누르면 시간을 기록하고 학부모에게 이 폰의 번호로 문자를 바로 보낸다.
- * 데이터는 모두 이 폰 안(SharedPreferences)에만 저장된다.
+ * 수인T 출결: 등원/하원 버튼을 누르면 시간을 기록하고 학부모 문자를 보낸다.
+ * 학생·출결·문구는 Firebase 에 저장되어 폰 앱과 노트북 웹, 조교 폰이 같은 기록을 본다.
+ * 문자는 outbox 에 쌓이고, "문자 발송 담당"을 켠 선생님 폰(SmsGatewayService)이 선생님 번호로 보낸다.
  */
 public class MainActivity extends Activity {
 
@@ -70,6 +89,14 @@ public class MainActivity extends Activity {
     private TextView summaryTv;
     private LinearLayout classBar;
     private Runnable pendingAfterPermission;
+    private final List<JSONObject> studentCache = new ArrayList<>();
+    private JSONObject dayCache = new JSONObject();
+    private JSONObject settingsCache = new JSONObject();
+    private String attachedDay = null;
+    private DatabaseReference dayRef;
+    private ValueEventListener dayListener;
+    private boolean studentsLoaded = false;
+    private final Handler ui = new Handler(Looper.getMainLooper());
     private int requestCode = 100;
 
     private final BroadcastReceiver sentReceiver = new BroadcastReceiver() {
@@ -92,7 +119,8 @@ public class MainActivity extends Activity {
         sp = getSharedPreferences("attend", MODE_PRIVATE);
         getWindow().setStatusBarColor(BG);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
-        setContentView(buildUi());
+        if (FirebaseAuth.getInstance().getCurrentUser() == null) showLogin();
+        else startApp();
 
         IntentFilter filter = new IntentFilter(ACTION_SENT);
         if (Build.VERSION.SDK_INT >= 33) {
@@ -100,13 +128,150 @@ public class MainActivity extends Activity {
         } else {
             registerReceiver(sentReceiver, filter);
         }
+    }
+
+    // ------------------------------------------------------------------ login + cloud
+
+    private void showLogin() {
+        LinearLayout v = new LinearLayout(this);
+        v.setOrientation(LinearLayout.VERTICAL);
+        v.setBackgroundColor(BG);
+        v.setPadding(dp(24), dp(80), dp(24), dp(24));
+        v.setFitsSystemWindows(true);
+        v.addView(text("수인T 출결", 26, INK, true));
+        TextView sub = text("선생님·조교 계정으로 로그인하면 폰·노트북이 같은 출결 기록을 봐요.", 14, MUTED, false);
+        sub.setPadding(0, dp(6), 0, dp(24));
+        v.addView(sub);
+        EditText email = input("이메일", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+        EditText pw = input("비밀번호", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        v.addView(email);
+        v.addView(pw);
+        Button go = button("로그인", INK, Color.WHITE);
+        LinearLayout.LayoutParams gp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        gp.topMargin = dp(16);
+        v.addView(go, gp);
+        go.setOnClickListener(x -> {
+            String e = email.getText().toString().trim(), p = pw.getText().toString();
+            if (e.isEmpty() || p.isEmpty()) { toast("이메일과 비밀번호를 넣어 주세요"); return; }
+            go.setEnabled(false);
+            FirebaseAuth.getInstance().signInWithEmailAndPassword(e, p)
+                    .addOnSuccessListener(r -> startApp())
+                    .addOnFailureListener(err -> { go.setEnabled(true); toast("로그인하지 못했어요. 이메일·비밀번호를 확인해 주세요."); });
+        });
+        setContentView(v);
+    }
+
+    private void startApp() {
+        setContentView(buildUi());
         render();
+        Cloud.root().child("students").addValueEventListener(new ValueEventListener() {
+            @Override
+            public void onDataChange(DataSnapshot snap) {
+                studentCache.clear();
+                for (DataSnapshot c : snap.getChildren()) {
+                    JSONObject o = Cloud.toJson(c.getValue());
+                    try { o.put("id", c.getKey()); } catch (JSONException ignored) { }
+                    studentCache.add(o);
+                }
+                boolean first = !studentsLoaded;
+                studentsLoaded = true;
+                if (first) migrateLocalData();
+                render();
+            }
+            @Override public void onCancelled(DatabaseError e) { toast("학생 목록을 불러오지 못했어요: " + e.getMessage()); }
+        });
+        Cloud.root().child("settings").addValueEventListener(new ValueEventListener() {
+            @Override public void onDataChange(DataSnapshot snap) { settingsCache = Cloud.toJson(snap.getValue()); }
+            @Override public void onCancelled(DatabaseError e) { }
+        });
+        if (sp.getBoolean("gateway", false)) SmsGatewayService.start(this);
+        else if (!sp.getBoolean("gatewayAsked", false)) askGateway();
+    }
+
+    private void attachDay() {
+        String key = dayKey(day);
+        if (key.equals(attachedDay)) return;
+        if (dayRef != null && dayListener != null) dayRef.removeEventListener(dayListener);
+        attachedDay = key;
+        dayCache = new JSONObject();
+        dayRef = Cloud.root().child("days").child(key);
+        dayListener = new ValueEventListener() {
+            @Override public void onDataChange(DataSnapshot snap) { dayCache = Cloud.toJson(snap.getValue()); render(); }
+            @Override public void onCancelled(DatabaseError e) { }
+        };
+        dayRef.addValueEventListener(dayListener);
+    }
+
+    /** 처음 로그인했을 때 이 폰에만 있던 학생·출결 기록을 Firebase 로 한 번 올린다 */
+    private void migrateLocalData() {
+        if (sp.getBoolean("migrated", false)) return;
+        sp.edit().putBoolean("migrated", true).apply();
+        if (!studentCache.isEmpty()) return;
+        try {
+            JSONArray a = new JSONArray(sp.getString("students", "[]"));
+            if (a.length() == 0) return;
+            Map<String, Object> up = new HashMap<>();
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.getJSONObject(i);
+                String id = o.optString("id");
+                JSONObject copy = new JSONObject(o.toString());
+                copy.remove("id");
+                up.put("students/" + id, Cloud.toFirebase(copy));
+            }
+            for (String k : sp.getAll().keySet()) {
+                if (!k.startsWith("rec_")) continue;
+                JSONObject rec = new JSONObject(sp.getString(k, "{}"));
+                Iterator<String> it = rec.keys();
+                while (it.hasNext()) {
+                    String sid = it.next();
+                    up.put("days/" + k.substring(4) + "/" + sid, Cloud.toFirebase(rec.get(sid)));
+                }
+            }
+            if (sp.contains("tplIn")) up.put("settings/tplIn", sp.getString("tplIn", DEFAULT_IN));
+            if (sp.contains("tplOut")) up.put("settings/tplOut", sp.getString("tplOut", DEFAULT_OUT));
+            Cloud.root().updateChildren(up);
+            toast("이 폰에 있던 학생 " + a.length() + "명과 출결 기록을 올렸어요");
+        } catch (JSONException ignored) { }
+    }
+
+    private void askGateway() {
+        new AlertDialog.Builder(this)
+                .setTitle("이 폰에서 학부모 문자를 보낼까요?")
+                .setMessage("선생님 번호(유심)가 들어 있는 폰만 '예'를 누르세요.\n노트북·조교 폰에서 체크해도 이 폰이 대신 문자를 보내요. 이 폰은 켜져 있고 인터넷이 연결돼 있어야 해요.")
+                .setPositiveButton("예, 이 폰이 보내요", (d, w) -> { sp.edit().putBoolean("gatewayAsked", true).apply(); enableGateway(); })
+                .setNegativeButton("아니요", (d, w) -> sp.edit().putBoolean("gatewayAsked", true).apply())
+                .show();
+    }
+
+    private void enableGateway() {
+        List<String> need = new ArrayList<>();
+        if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.SEND_SMS);
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.POST_NOTIFICATIONS);
+        if (!need.isEmpty()) {
+            pendingAfterPermission = this::enableGateway;
+            requestPermissions(need.toArray(new String[0]), REQ_SMS);
+            return;
+        }
+        sp.edit().putBoolean("gateway", true).apply();
+        SmsGatewayService.start(this);
+        toast("이 폰이 학부모 문자를 보내요");
+        PowerManager pm = getSystemService(PowerManager.class);
+        if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+            try {
+                startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+            } catch (Exception ignored) { }
+        }
+    }
+
+    private void disableGateway() {
+        sp.edit().putBoolean("gateway", false).apply();
+        SmsGatewayService.stop(this);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        render();
+        if (listBox != null) render();
     }
 
     @Override
@@ -227,10 +392,9 @@ public class MainActivity extends Activity {
 
     private List<JSONObject> students() {
         List<JSONObject> out = new ArrayList<>();
-        try {
-            JSONArray a = new JSONArray(sp.getString("students", "[]"));
-            for (int i = 0; i < a.length(); i++) out.add(a.getJSONObject(i));
-        } catch (JSONException ignored) { }
+        for (JSONObject o : studentCache) {
+            try { out.add(new JSONObject(o.toString())); } catch (JSONException ignored) { }
+        }
         Collections.sort(out, (x, y) -> {
             int c = classKey(x).compareTo(classKey(y));
             return c != 0 ? c : x.optString("name").compareTo(y.optString("name"));
@@ -238,22 +402,49 @@ public class MainActivity extends Activity {
         return out;
     }
 
+    /** 바뀐 학생만 Firebase 에 쓰고, 목록에서 빠진 학생은 지운다 */
     private void saveStudents(List<JSONObject> list) {
-        JSONArray a = new JSONArray();
-        for (JSONObject o : list) a.put(o);
-        sp.edit().putString("students", a.toString()).apply();
+        Map<String, Object> up = new HashMap<>();
+        Set<String> keep = new HashSet<>();
+        for (JSONObject o : list) {
+            String id = o.optString("id");
+            if (id.isEmpty()) continue;
+            keep.add(id);
+            JSONObject old = null;
+            for (JSONObject c : studentCache) if (id.equals(c.optString("id"))) old = c;
+            if (old != null && old.toString().equals(o.toString())) continue;
+            try {
+                JSONObject copy = new JSONObject(o.toString());
+                copy.remove("id");
+                up.put(id, Cloud.toFirebase(copy));
+            } catch (JSONException ignored) { }
+        }
+        for (JSONObject c : studentCache) if (!keep.contains(c.optString("id"))) up.put(c.optString("id"), null);
+        if (!up.isEmpty()) Cloud.root().child("students").updateChildren(up);
     }
 
     private JSONObject record() {
-        try {
-            return new JSONObject(sp.getString("rec_" + dayKey(day), "{}"));
-        } catch (JSONException e) {
-            return new JSONObject();
-        }
+        attachDay();
+        try { return new JSONObject(dayCache.toString()); } catch (JSONException e) { return new JSONObject(); }
     }
 
+    /** 이 날짜에서 바뀐 학생 기록만 쓴다 (다른 기기에서 동시에 체크해도 서로 덮어쓰지 않게) */
     private void saveRecord(JSONObject rec) {
-        sp.edit().putString("rec_" + dayKey(day), rec.toString()).apply();
+        Map<String, Object> up = new HashMap<>();
+        Iterator<String> it = rec.keys();
+        Set<String> seen = new HashSet<>();
+        while (it.hasNext()) {
+            String sid = it.next();
+            seen.add(sid);
+            JSONObject e = rec.optJSONObject(sid);
+            JSONObject old = dayCache.optJSONObject(sid);
+            if (old != null && e != null && old.toString().equals(e.toString())) continue;
+            up.put(sid, e == null || e.length() == 0 ? null : Cloud.toFirebase(e));
+        }
+        Iterator<String> ot = dayCache.keys();
+        while (ot.hasNext()) { String sid = ot.next(); if (!seen.contains(sid)) up.put(sid, null); }
+        dayCache = rec;
+        if (!up.isEmpty()) Cloud.root().child("days").child(dayKey(day)).updateChildren(up);
     }
 
     private static String digits(String s) {
@@ -299,6 +490,7 @@ public class MainActivity extends Activity {
 
     private void render() {
         if (listBox == null) return;
+        attachDay();
         String[] week = {"일", "월", "화", "수", "목", "금", "토"};
         dateTv.setText((day.get(Calendar.MONTH) + 1) + "월 " + day.get(Calendar.DAY_OF_MONTH) + "일 ("
                 + week[day.get(Calendar.DAY_OF_WEEK) - 1] + ")" + (isToday() ? "  오늘" : ""));
@@ -447,11 +639,6 @@ public class MainActivity extends Activity {
     }
 
     private void doCheck(JSONObject s, String kind, String time) {
-        if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) {
-            pendingAfterPermission = () -> doCheck(s, kind, time);
-            requestPermissions(new String[]{Manifest.permission.SEND_SMS}, REQ_SMS);
-            return;
-        }
         JSONObject rec = record();
         try {
             JSONObject e = rec.optJSONObject(s.optString("id"));
@@ -469,29 +656,43 @@ public class MainActivity extends Activity {
     }
 
     private String fill(JSONObject s, String kind, String time) {
-        String t = sp.getString("in".equals(kind) ? "tplIn" : "tplOut", "in".equals(kind) ? DEFAULT_IN : DEFAULT_OUT);
+        String t = settingsCache.optString("in".equals(kind) ? "tplIn" : "tplOut", "");
+        if (t.isEmpty()) t = "in".equals(kind) ? DEFAULT_IN : DEFAULT_OUT;
         String date = (day.get(Calendar.MONTH) + 1) + "월 " + day.get(Calendar.DAY_OF_MONTH) + "일";
         return t.replace("{이름}", s.optString("name")).replace("{시간}", time).replace("{날짜}", date);
     }
 
+    /** 문자를 outbox 에 넣는다. 선생님 폰(발송 담당)이 받아서 보낸다. */
     private void sendSms(String name, String phone, String msg) {
-        try {
-            SmsManager sm = Build.VERSION.SDK_INT >= 31 ? getSystemService(SmsManager.class) : SmsManager.getDefault();
-            ArrayList<String> parts = sm.divideMessage(msg);
-            ArrayList<PendingIntent> sent = new ArrayList<>();
-            for (int i = 0; i < parts.size(); i++) {
-                if (i == 0) {
-                    Intent it = new Intent(ACTION_SENT).setPackage(getPackageName()).putExtra("name", name + "(" + prettyPhone(phone) + ")");
-                    sent.add(PendingIntent.getBroadcast(this, requestCode++, it,
-                            PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
-                } else {
-                    sent.add(null);
+        DatabaseReference ref = Cloud.root().child("outbox").push();
+        Map<String, Object> m = new HashMap<>();
+        m.put("to", digits(phone));
+        m.put("body", msg);
+        m.put("name", name);
+        m.put("by", FirebaseAuth.getInstance().getCurrentUser() != null ? FirebaseAuth.getInstance().getCurrentUser().getEmail() : "");
+        m.put("createdAt", ServerValue.TIMESTAMP);
+        m.put("status", "pending");
+        ref.setValue(m);
+        final String who = name + "(" + prettyPhone(phone) + ")";
+        final boolean[] done = {false};
+        ValueEventListener w = new ValueEventListener() {
+            @Override
+            public void onDataChange(DataSnapshot snap) {
+                Object st = snap.child("status").getValue();
+                if ("sent".equals(st)) { done[0] = true; toast(who + " 문자 보냄"); ref.removeEventListener(this); }
+                else if ("failed".equals(st) || "expired".equals(st)) {
+                    done[0] = true;
+                    toast(who + " 문자 실패: " + snap.child("error").getValue());
+                    ref.removeEventListener(this);
                 }
             }
-            sm.sendMultipartTextMessage(digits(phone), null, parts, sent, null);
-        } catch (Exception e) {
-            toast(name + " 문자를 보내지 못했어요: " + e.getMessage());
-        }
+            @Override public void onCancelled(DatabaseError e) { }
+        };
+        ref.addValueEventListener(w);
+        ui.postDelayed(() -> {
+            if (!done[0]) toast(who + " 문자 대기 중 · 선생님 폰이 꺼져 있거나 인터넷이 끊겼을 수 있어요");
+        }, 20000);
+        ui.postDelayed(() -> ref.removeEventListener(w), 120000);
     }
 
     @Override
@@ -501,7 +702,7 @@ public class MainActivity extends Activity {
         if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
             if (pendingAfterPermission != null) pendingAfterPermission.run();
         } else {
-            toast("문자 권한이 있어야 학부모에게 문자를 보낼 수 있어요");
+            toast("권한을 허용해야 이 폰에서 학부모 문자를 보낼 수 있어요");
         }
         pendingAfterPermission = null;
     }
@@ -773,16 +974,31 @@ public class MainActivity extends Activity {
         v.addView(text("{이름} {시간} {날짜} 자리에 실제 값이 들어가요. 한글 45자를 넘으면 문자가 여러 통으로 나뉘어 가요.", 13, MUTED, false));
         v.addView(text("등원 문구", 13, INK, true));
         EditText in = input("", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
-        in.setText(sp.getString("tplIn", DEFAULT_IN));
+        in.setText(settingsCache.optString("tplIn", DEFAULT_IN));
         v.addView(in);
         v.addView(text("하원 문구", 13, INK, true));
         EditText out = input("", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
-        out.setText(sp.getString("tplOut", DEFAULT_OUT));
+        out.setText(settingsCache.optString("tplOut", DEFAULT_OUT));
         v.addView(out);
         CheckBox confirm = new CheckBox(this);
         confirm.setText("보내기 전에 한 번 확인하기");
         confirm.setChecked(sp.getBoolean("confirm", false));
         v.addView(confirm);
+        CheckBox gw = new CheckBox(this);
+        gw.setText("이 폰에서 학부모 문자 보내기 (선생님 폰만 켜기)");
+        gw.setChecked(sp.getBoolean("gateway", false));
+        v.addView(gw);
+        String me = FirebaseAuth.getInstance().getCurrentUser() != null ? FirebaseAuth.getInstance().getCurrentUser().getEmail() : "";
+        TextView acct = text("로그인: " + me, 12, MUTED, false);
+        acct.setPadding(0, dp(10), 0, 0);
+        v.addView(acct);
+        Button logout = button("로그아웃", Color.WHITE, INK);
+        logout.setOnClickListener(x -> {
+            disableGateway();
+            FirebaseAuth.getInstance().signOut();
+            recreate();
+        });
+        v.addView(logout, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)));
         ScrollView sc = new ScrollView(this);
         sc.addView(v);
         new AlertDialog.Builder(this)
@@ -791,15 +1007,17 @@ public class MainActivity extends Activity {
                 .setPositiveButton("저장", (d, w) -> {
                     String a = in.getText().toString().trim();
                     String b = out.getText().toString().trim();
-                    sp.edit()
-                            .putString("tplIn", a.isEmpty() ? DEFAULT_IN : a)
-                            .putString("tplOut", b.isEmpty() ? DEFAULT_OUT : b)
-                            .putBoolean("confirm", confirm.isChecked())
-                            .apply();
+                    Map<String, Object> t = new HashMap<>();
+                    t.put("tplIn", a.isEmpty() ? DEFAULT_IN : a);
+                    t.put("tplOut", b.isEmpty() ? DEFAULT_OUT : b);
+                    Cloud.root().child("settings").updateChildren(t);
+                    sp.edit().putBoolean("confirm", confirm.isChecked()).apply();
+                    if (gw.isChecked() && !sp.getBoolean("gateway", false)) enableGateway();
+                    else if (!gw.isChecked() && sp.getBoolean("gateway", false)) disableGateway();
                     toast("저장했어요");
                 })
                 .setNeutralButton("기본값", (d, w) -> {
-                    sp.edit().remove("tplIn").remove("tplOut").apply();
+                    Cloud.root().child("settings").removeValue();
                     toast("기본 문구로 되돌렸어요");
                 })
                 .setNegativeButton("취소", null)
