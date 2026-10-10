@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "749166061665",
+    "firebase_url": "https://suin-attend-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "suin-attend",
+    "storage_bucket": "suin-attend.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:749166061665:android:841fd7b8fafc1377912220",
+        "android_client_info": {
+          "package_name": "kr.suin.attend"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAq0jTsnz24OFFad-WHh32kjUCHitvXWNc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
