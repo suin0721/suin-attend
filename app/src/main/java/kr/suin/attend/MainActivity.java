@@ -88,6 +88,11 @@ public class MainActivity extends Activity {
     private TextView dateTv;
     private TextView summaryTv;
     private LinearLayout classBar;
+    private LinearLayout selBar;
+    private boolean selMode = false;
+    private final Set<String> selected = new HashSet<>();
+    /** special filter value: students who checked in and have not left yet */
+    private static final String IN_NOW = "__in";
     private Runnable pendingAfterPermission;
     private final List<JSONObject> studentCache = new ArrayList<>();
     private JSONObject dayCache = new JSONObject();
@@ -391,6 +396,11 @@ public class MainActivity extends Activity {
         hs.addView(classBar);
         root.addView(hs);
 
+        selBar = new LinearLayout(this);
+        selBar.setGravity(Gravity.CENTER_VERTICAL);
+        selBar.setPadding(0, 0, 0, dp(10));
+        root.addView(selBar);
+
         ScrollView scroll = new ScrollView(this);
         listBox = new LinearLayout(this);
         listBox.setOrientation(LinearLayout.VERTICAL);
@@ -520,37 +530,47 @@ public class MainActivity extends Activity {
         int nIn = 0, nOut = 0;
         listBox.removeAllViews();
 
-        // class tabs
+        // tabs: 전체 · 지금 등원 중 · 반별
         List<String> classes = classNames(all);
-        String filter = sp.getString("filter", "");
-        if (!filter.isEmpty() && !classes.contains(filter)) filter = "";
+        String f0 = sp.getString("filter", "");
+        if (!f0.isEmpty() && !IN_NOW.equals(f0) && !classes.contains(f0)) f0 = "";
+        final String filter = f0;
+        final JSONObject recNow = rec;
+        int inNow = 0;
+        for (JSONObject o : all) if (isIn(recNow, o)) inNow++;
         classBar.removeAllViews();
-        if (!classes.isEmpty()) {
-            List<String> tabs = new ArrayList<>();
-            tabs.add("");
-            tabs.addAll(classes);
-            for (String c : tabs) {
-                boolean on = c.equals(filter);
+        if (!all.isEmpty()) {
+            addChip("전체 " + all.size(), "", filter, false);
+            addChip("지금 등원 중 " + inNow, IN_NOW, filter, true);
+            for (String c : classes) {
                 int cnt = 0;
-                for (JSONObject o : all) if (c.isEmpty() || c.equals(o.optString("cls", "").trim())) cnt++;
-                Button chip = button((c.isEmpty() ? "전체" : c) + " " + cnt, on ? INK : Color.WHITE, on ? Color.WHITE : INK);
-                chip.setTextSize(14);
-                chip.setMinWidth(dp(56));
-                chip.setPadding(dp(14), dp(6), dp(14), dp(6));
-                chip.setOnClickListener(v -> { sp.edit().putString("filter", c).apply(); render(); });
-                LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
-                cp.rightMargin = dp(6);
-                classBar.addView(chip, cp);
+                for (JSONObject o : all) if (c.equals(o.optString("cls", "").trim())) cnt++;
+                addChip(c + " " + cnt, c, filter, false);
             }
         }
         List<JSONObject> list = new ArrayList<>();
-        for (JSONObject o : all) if (filter.isEmpty() || filter.equals(o.optString("cls", "").trim())) list.add(o);
+        for (JSONObject o : all) {
+            if (IN_NOW.equals(filter)) { if (isIn(recNow, o)) list.add(o); }
+            else if (filter.isEmpty() || filter.equals(o.optString("cls", "").trim())) list.add(o);
+        }
+        Set<String> visible = new HashSet<>();
+        for (JSONObject o : list) visible.add(o.optString("id"));
+        selected.retainAll(visible);
+        renderSelBar(list, recNow);
 
         if (loadError != null) {
             summaryTv.setText("");
             TextView err = text(loadError, 15, 0xFFC0392B, false);
             err.setPadding(dp(8), dp(40), dp(8), dp(12));
             listBox.addView(err);
+            return;
+        }
+        if (list.isEmpty() && !all.isEmpty()) {
+            summaryTv.setText("");
+            TextView empty = text(IN_NOW.equals(filter) ? "지금 등원 중인 학생이 없어요.\n등원하고 아직 하원하지 않은 학생이 여기 모여요." : "이 반에는 학생이 없어요.", 15, MUTED, false);
+            empty.setGravity(Gravity.CENTER);
+            empty.setPadding(dp(8), dp(40), dp(8), dp(12));
+            listBox.addView(empty);
             return;
         }
         if (list.isEmpty()) {
@@ -574,7 +594,7 @@ public class MainActivity extends Activity {
         String lastClass = null;
         for (JSONObject s : list) {
             String cls = s.optString("cls", "").trim();
-            if (filter.isEmpty() && !classes.isEmpty() && !cls.equals(lastClass)) {
+            if ((filter.isEmpty() || IN_NOW.equals(filter)) && !classes.isEmpty() && !cls.equals(lastClass)) {
                 int cnt = 0;
                 for (JSONObject o : list) if (cls.equals(o.optString("cls", "").trim())) cnt++;
                 TextView h = text((cls.isEmpty() ? "반 없음" : cls) + " · " + cnt + "명", 14, MUTED, true);
@@ -592,7 +612,15 @@ public class MainActivity extends Activity {
             LinearLayout row = new LinearLayout(this);
             row.setGravity(Gravity.CENTER_VERTICAL);
             int fill = !tout.isEmpty() ? AMBER_SOFT : !tin.isEmpty() ? GREEN_SOFT : Color.WHITE;
-            row.setBackground(box(fill, LINE, 12));
+            boolean picked = selected.contains(id);
+            row.setBackground(box(fill, selMode && picked ? INK : LINE, 12));
+            if (selMode) {
+                CheckBox cb = new CheckBox(this);
+                cb.setChecked(picked);
+                cb.setClickable(false);
+                row.addView(cb);
+                row.setOnClickListener(v -> { if (selected.contains(id)) selected.remove(id); else selected.add(id); render(); });
+            }
             row.setPadding(dp(14), dp(10), dp(10), dp(10));
 
             LinearLayout who = new LinearLayout(this);
@@ -613,7 +641,8 @@ public class MainActivity extends Activity {
                 times.addView(t);
             }
             who.addView(times);
-            who.setOnClickListener(v -> editStudent(s, this::render));
+            if (selMode) who.setOnClickListener(v -> { if (selected.contains(id)) selected.remove(id); else selected.add(id); render(); });
+            else who.setOnClickListener(v -> editStudent(s, this::render));
             row.addView(who, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
             Button b;
@@ -628,13 +657,117 @@ public class MainActivity extends Activity {
                 b.setEnabled(false);
             }
             if (!isToday()) { b.setEnabled(false); b.setAlpha(0.4f); }
-            row.addView(b, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)));
+            if (!selMode) row.addView(b, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)));
 
             LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             rp.bottomMargin = dp(8);
             listBox.addView(row, rp);
         }
-        summaryTv.setText((filter.isEmpty() ? "" : "총 " + all.size() + "명 중 ") + (filter.isEmpty() ? "총 " : filter + " ") + list.size() + "명" + "   등원 " + nIn + "   하원 " + nOut + "   미등원 " + (list.size() - nIn));
+        String fname = IN_NOW.equals(filter) ? "지금 등원 중" : filter;
+        summaryTv.setText((filter.isEmpty() ? "" : "총 " + all.size() + "명 중 ") + (filter.isEmpty() ? "총 " : fname + " ") + list.size() + "명" + "   등원 " + nIn + "   하원 " + nOut + "   미등원 " + (list.size() - nIn));
+    }
+
+    private static boolean isIn(JSONObject rec, JSONObject s) {
+        JSONObject e = rec.optJSONObject(s.optString("id"));
+        return e != null && !e.optString("in", "").isEmpty() && e.optString("out", "").isEmpty();
+    }
+
+    private void addChip(String label, String value, String current, boolean special) {
+        boolean on = value.equals(current);
+        int bg = on ? (special ? GREEN : INK) : Color.WHITE;
+        int fg = on ? Color.WHITE : (special ? GREEN : INK);
+        Button chip = button(label, bg, fg);
+        chip.setTextSize(14);
+        chip.setMinWidth(dp(56));
+        chip.setPadding(dp(14), dp(6), dp(14), dp(6));
+        chip.setOnClickListener(v -> { sp.edit().putString("filter", value).apply(); render(); });
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
+        cp.rightMargin = dp(6);
+        classBar.addView(chip, cp);
+    }
+
+    /** 여러 명 선택: 선택 모드 버튼, 전체 선택, 선택한 학생 한꺼번에 등원/하원 */
+    private void renderSelBar(List<JSONObject> list, JSONObject rec) {
+        selBar.removeAllViews();
+        if (list.isEmpty() || !isToday()) { selMode = false; return; }
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(42));
+        lp.rightMargin = dp(6);
+        if (!selMode) {
+            Button go = button("여러 명 선택", Color.WHITE, INK);
+            go.setTextSize(14);
+            go.setOnClickListener(v -> { selMode = true; selected.clear(); render(); });
+            selBar.addView(go, lp);
+            return;
+        }
+        List<JSONObject> canIn = new ArrayList<>(), canOut = new ArrayList<>();
+        int picked = 0;
+        for (JSONObject s : list) {
+            if (!selected.contains(s.optString("id"))) continue;
+            picked++;
+            JSONObject e = rec.optJSONObject(s.optString("id"));
+            String tin = e == null ? "" : e.optString("in", ""), tout = e == null ? "" : e.optString("out", "");
+            if (tin.isEmpty()) canIn.add(s);
+            else if (tout.isEmpty()) canOut.add(s);
+        }
+        final boolean allOn = picked == list.size();
+        final int pickedN = picked;
+        Button all = button(allOn ? "전체 해제" : "전체 선택", Color.WHITE, INK);
+        all.setTextSize(14);
+        all.setMinWidth(0);
+        all.setOnClickListener(v -> {
+            if (allOn) selected.clear(); else for (JSONObject s : list) selected.add(s.optString("id"));
+            render();
+        });
+        Button bin = button("등원 " + canIn.size(), GREEN, Color.WHITE);
+        bin.setTextSize(14); bin.setMinWidth(0);
+        bin.setEnabled(!canIn.isEmpty()); if (canIn.isEmpty()) bin.setAlpha(0.4f);
+        bin.setOnClickListener(v -> bulkCheck("in", canIn, pickedN));
+        Button bout = button("하원 " + canOut.size(), AMBER, Color.WHITE);
+        bout.setTextSize(14); bout.setMinWidth(0);
+        bout.setEnabled(!canOut.isEmpty()); if (canOut.isEmpty()) bout.setAlpha(0.4f);
+        bout.setOnClickListener(v -> bulkCheck("out", canOut, pickedN));
+        Button cancel = button("취소", Color.WHITE, INK);
+        cancel.setTextSize(14); cancel.setMinWidth(0);
+        cancel.setOnClickListener(v -> { selMode = false; selected.clear(); render(); });
+        selBar.addView(all, lp);
+        selBar.addView(bin, lp);
+        selBar.addView(bout, lp);
+        selBar.addView(cancel, lp);
+    }
+
+    private void bulkCheck(String kind, List<JSONObject> targets, int pickedCount) {
+        String label = "in".equals(kind) ? "등원" : "하원";
+        pickTime(targets.size() + "명 " + label + " 시간", now(), time -> {
+            StringBuilder names = new StringBuilder();
+            for (JSONObject s : targets) names.append(names.length() == 0 ? "" : ", ").append(s.optString("name"));
+            int skipped = pickedCount - targets.size();
+            new AlertDialog.Builder(this)
+                    .setTitle(targets.size() + "명 " + time + " " + label)
+                    .setMessage(names + (skipped > 0 ? "\n\n(선택한 학생 중 " + skipped + "명은 이미 " + label + "했거나 대상이 아니라 빠졌어요)" : "")
+                            + "\n\n학부모마다 각자 이름이 들어간 문자가 따로 가요.")
+                    .setPositiveButton("문자 " + targets.size() + "통 보내기", (d, w) -> doBulk(kind, targets, time, true))
+                    .setNeutralButton("문자 없이 기록만", (d, w) -> doBulk(kind, targets, time, false))
+                    .setNegativeButton("취소", null)
+                    .show();
+        });
+    }
+
+    private void doBulk(String kind, List<JSONObject> targets, String time, boolean withSms) {
+        JSONObject rec = record();
+        try {
+            for (JSONObject s : targets) {
+                JSONObject e = rec.optJSONObject(s.optString("id"));
+                if (e == null) e = new JSONObject();
+                e.put(kind, time);
+                rec.put(s.optString("id"), e);
+            }
+        } catch (JSONException ignored) { }
+        saveRecord(rec);
+        if (withSms) for (JSONObject s : targets) sendSms(s.optString("name"), s.optString("phone"), fill(s, kind, time), true);
+        selMode = false;
+        selected.clear();
+        render();
+        toast(targets.size() + "명 " + ("in".equals(kind) ? "등원" : "하원") + " " + time + " 기록" + (withSms ? " · 문자 " + targets.size() + "통 보내는 중" : ""));
     }
 
     /** 등원/하원 버튼: 시간을 고르는 창(기본값 = 지금)을 띄우고, 확인하면 기록 + 문자 */
@@ -690,7 +823,9 @@ public class MainActivity extends Activity {
     }
 
     /** 문자를 outbox 에 넣는다. 선생님 폰(발송 담당)이 받아서 보낸다. */
-    private void sendSms(String name, String phone, String msg) {
+    private void sendSms(String name, String phone, String msg) { sendSms(name, phone, msg, false); }
+
+    private void sendSms(String name, String phone, String msg, boolean quiet) {
         DatabaseReference ref = Cloud.root().child("outbox").push();
         Map<String, Object> m = new HashMap<>();
         m.put("to", digits(phone));
@@ -700,6 +835,7 @@ public class MainActivity extends Activity {
         m.put("createdAt", ServerValue.TIMESTAMP);
         m.put("status", "pending");
         ref.setValue(m);
+        if (quiet) return;
         final String who = name + "(" + prettyPhone(phone) + ")";
         final boolean[] done = {false};
         ValueEventListener w = new ValueEventListener() {
