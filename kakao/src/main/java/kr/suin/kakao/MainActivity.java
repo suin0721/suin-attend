@@ -28,6 +28,21 @@ import android.widget.Toast;
 
 import androidx.core.content.FileProvider;
 
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.MessageDigest;
+import java.security.PrivateKey;
+import java.security.spec.MGF1ParameterSpec;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.HashSet;
+import java.util.Set;
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.OAEPParameterSpec;
+import javax.crypto.spec.PSource;
+import javax.crypto.spec.SecretKeySpec;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -185,6 +200,115 @@ public class MainActivity extends Activity {
         return http(method, Config.DB_URL + "/" + path + ".json?auth=" + token(), body, "application/json");
     }
 
+    // ------------------------------------------------------------------ GitHub 우편함 (암호화)
+    // Claude는 Firebase에 직접 못 들어가므로, 이 폰의 공개 열쇠로 암호화한 공지를
+    // GitHub 저장소의 outbox 가지에 올린다. 풀 수 있는 건 이 폰(비밀 열쇠)뿐이다.
+    private static final String GH_LIST = "https://api.github.com/repos/suin0721/suin-attend/contents/outbox?ref=outbox";
+    private static final String GH_RAW = "https://raw.githubusercontent.com/suin0721/suin-attend/outbox/outbox/";
+
+    private void ensureKeys() throws Exception {
+        if (!sp.getString("priv", "").isEmpty()) return;
+        KeyPairGenerator g = KeyPairGenerator.getInstance("RSA");
+        g.initialize(2048);
+        KeyPair kp = g.generateKeyPair();
+        sp.edit().putString("priv", Base64.encodeToString(kp.getPrivate().getEncoded(), Base64.NO_WRAP))
+                .putString("pub", Base64.encodeToString(kp.getPublic().getEncoded(), Base64.NO_WRAP)).apply();
+    }
+
+    private String pubKey() { try { ensureKeys(); } catch (Exception ignored) { } return sp.getString("pub", ""); }
+
+    private String fingerprint() {
+        try {
+            byte[] h = MessageDigest.getInstance("SHA-256").digest(Base64.decode(pubKey(), Base64.NO_WRAP));
+            StringBuilder b = new StringBuilder();
+            for (int i = 0; i < 4; i++) b.append(String.format("%02X", h[i]));
+            return b.toString();
+        } catch (Exception e) { return "?"; }
+    }
+
+    private byte[] unwrapKey(String ek) throws Exception {
+        PrivateKey pk = KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(Base64.decode(sp.getString("priv", ""), Base64.NO_WRAP)));
+        Cipher c = Cipher.getInstance("RSA/ECB/OAEPPadding");
+        c.init(Cipher.DECRYPT_MODE, pk, new OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT));
+        return c.doFinal(Base64.decode(ek, Base64.DEFAULT));
+    }
+
+    private static byte[] aesOpen(byte[] key, String iv, byte[] ct) throws Exception {
+        Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+        c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, Base64.decode(iv, Base64.DEFAULT)));
+        return c.doFinal(ct);
+    }
+
+    private static byte[] getBytes(String url) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(20000);
+        c.setReadTimeout(120000);
+        c.setRequestProperty("Cache-Control", "no-cache");
+        int code = c.getResponseCode();
+        if (code >= 400) throw new Exception("HTTP " + code);
+        try (InputStream in = c.getInputStream()) {
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+            return bo.toByteArray();
+        }
+    }
+
+    private Set<String> localSet(String k) { return new HashSet<>(sp.getStringSet(k, new HashSet<>())); }
+
+    /** GitHub 우편함의 항목들을 풀어서 목록 형식(JSONObject)으로 돌려준다. */
+    private List<JSONObject> loadGithub() {
+        List<JSONObject> out = new ArrayList<>();
+        try {
+            if (sp.getString("priv", "").isEmpty()) return out;
+            String list = new String(getBytes(GH_LIST), StandardCharsets.UTF_8);
+            JSONArray arr = new JSONArray(list);
+            Set<String> gone = localSet("ghDeleted"), sent = localSet("ghSent");
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject e = arr.getJSONObject(i);
+                String name = e.optString("name");
+                if (!name.endsWith(".json")) continue;
+                String id = "gh:" + name.replace(".json", "");
+                if (gone.contains(id)) continue;
+                try {
+                    JSONObject env = new JSONObject(new String(getBytes(GH_RAW + name), StandardCharsets.UTF_8));
+                    byte[] key = unwrapKey(env.getString("ek"));
+                    JSONObject o = new JSONObject(new String(aesOpen(key, env.getString("iv"), Base64.decode(env.getString("ct"), Base64.DEFAULT)), StandardCharsets.UTF_8));
+                    o.put("_id", id);
+                    o.put("_key", Base64.encodeToString(key, Base64.NO_WRAP));
+                    if (sent.contains(id)) { o.put("status", "shared"); o.put("sharedAt", sp.getLong("sentAt:" + id, 0)); }
+                    out.add(o);
+                } catch (Exception bad) {
+                    // 다른 열쇠로 잠긴 항목(예전 폰용)은 건너뜀
+                }
+            }
+        } catch (Exception ignored) { }
+        return out;
+    }
+
+    private void showKeyDialog() {
+        String k = pubKey();
+        LinearLayout v = new LinearLayout(this);
+        v.setOrientation(LinearLayout.VERTICAL);
+        v.setPadding(dp(20), dp(8), dp(20), 0);
+        v.addView(text("아래 [열쇠 복사]를 눌러 Claude 채팅에 붙여넣어 주세요. Claude는 이 열쇠로 공지를 잠가서 보내고, 여는 건 이 폰만 할 수 있어요. 한 번만 하면 돼요.", 14, INK, false));
+        TextView fp = text("열쇠 확인 번호: " + fingerprint(), 15, INK, true);
+        fp.setPadding(0, dp(12), 0, dp(4));
+        v.addView(fp);
+        TextView kt = text(k.length() > 60 ? k.substring(0, 60) + "…" : k, 12, MUTED, false);
+        v.addView(kt);
+        new AlertDialog.Builder(this)
+                .setTitle("Claude 연결 열쇠")
+                .setView(v)
+                .setPositiveButton("열쇠 복사", (d, w) -> {
+                    ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("열쇠", "수인T카톡열쇠:" + k));
+                    toast("복사했어요. Claude 채팅에 붙여넣어 주세요");
+                })
+                .setNegativeButton("닫기", null).show();
+    }
+
     // ------------------------------------------------------------------ login
 
     private void showLogin() {
@@ -234,9 +358,10 @@ public class MainActivity extends Activity {
         refresh.setOnClickListener(x -> load());
         Button more = button("⋯", Color.WHITE, INK);
         more.setOnClickListener(x -> new AlertDialog.Builder(this)
-                .setTitle("계정")
-                .setMessage("로그인: " + sp.getString("email", ""))
-                .setPositiveButton("로그아웃", (d, w) -> { sp.edit().remove("refresh").apply(); idToken = null; showLogin(); })
+                .setTitle("설정")
+                .setMessage("로그인: " + sp.getString("email", "") + "\n열쇠 확인 번호: " + fingerprint())
+                .setPositiveButton("Claude 연결 열쇠", (d, w) -> showKeyDialog())
+                .setNeutralButton("로그아웃", (d, w) -> { sp.edit().remove("refresh").apply(); idToken = null; showLogin(); })
                 .setNegativeButton("닫기", null).show());
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44));
         lp.leftMargin = dp(8);
@@ -254,6 +379,7 @@ public class MainActivity extends Activity {
         root.addView(sc, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
         setContentView(root);
         load();
+        if (!sp.getBoolean("keyShown", false)) { sp.edit().putBoolean("keyShown", true).apply(); ui.postDelayed(this::showKeyDialog, 600); }
     }
 
     private void load() {
@@ -261,8 +387,9 @@ public class MainActivity extends Activity {
         if (status != null) status.setText("불러오는 중…");
         io.execute(() -> {
             try {
-                String s = db("GET", "kakaoOutbox", null);
-                List<JSONObject> items = new ArrayList<>();
+                List<JSONObject> items = new ArrayList<>(loadGithub());
+                String s = "null";
+                try { s = db("GET", "kakaoOutbox", null); } catch (Exception fe) { if (items.isEmpty()) throw fe; }
                 if (s != null && !s.trim().equals("null")) {
                     JSONObject all = new JSONObject(s);
                     Iterator<String> it = all.keys();
@@ -393,6 +520,15 @@ public class MainActivity extends Activity {
                     JSONObject f = fs.getJSONObject(i);
                     String safe = f.optString("name", "file").replaceAll("[\\\\/:*?\"<>|]", "_");
                     File out = new File(dir, safe);
+                    if (f.has("blob")) {
+                        ui.post(() -> pd.setMessage("파일 받는 중… " + f.optString("name")));
+                        byte[] key = Base64.decode(o.getString("_key"), Base64.NO_WRAP);
+                        byte[] plain = aesOpen(key, f.getString("iv"), getBytes(GH_RAW + f.getString("blob")));
+                        try (FileOutputStream fo = new FileOutputStream(out)) { fo.write(plain); }
+                        if (f.optLong("size") > 0 && out.length() != f.optLong("size")) throw new Exception(f.optString("name") + " 파일이 다 받아지지 않았어요");
+                        uris.add(FileProvider.getUriForFile(this, "kr.suin.kakao.files", out));
+                        continue;
+                    }
                     int chunks = f.optInt("chunks", 1);
                     try (FileOutputStream fo = new FileOutputStream(out)) {
                         for (int k = 0; k < chunks; k++) {
@@ -451,6 +587,15 @@ public class MainActivity extends Activity {
 
     private void setStatus(String id, String st) {
         if (id == null || id.isEmpty()) return;
+        if (id.startsWith("gh:")) {
+            Set<String> set = localSet("shared".equals(st) ? "ghSent" : "ghDeleted");
+            set.add(id);
+            SharedPreferences.Editor ed = sp.edit().putStringSet("shared".equals(st) ? "ghSent" : "ghDeleted", set);
+            if ("shared".equals(st)) ed.putLong("sentAt:" + id, System.currentTimeMillis());
+            ed.apply();
+            load();
+            return;
+        }
         io.execute(() -> {
             try {
                 JSONObject b = new JSONObject().put("status", st);
