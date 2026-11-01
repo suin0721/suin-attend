@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- 말풍선 + 보내기 화살표 -->
+    <path android:fillColor="#3A1D1D"
+        android:pathData="M54,30 C38,30 26,40 26,52 C26,60 31,66 38,70 L36,80 L46,73 C48.5,73.6 51.2,74 54,74 C70,74 82,64 82,52 C82,40 70,30 54,30 Z" />
+    <path android:fillColor="#00000000" android:strokeColor="#FEE500" android:strokeWidth="5"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:pathData="M42,53 L66,53 M58,45 L66,53 L58,61" />
+</vector>
