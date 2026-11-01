@@ -100,6 +100,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (listBox != null) load();
+        if (pendUris != null) ui.postDelayed(this::askPendingFiles, 400);
     }
 
     // ------------------------------------------------------------------ small UI helpers
@@ -549,16 +550,31 @@ public class MainActivity extends Activity {
         });
     }
 
+    // 카카오톡은 파일과 문구를 한 번에 받으면 문구를 버린다 → 문구 먼저, 파일은 그다음에 따로 보낸다.
+    private JSONObject pendO;
+    private JSONArray pendFs;
+    private ArrayList<Uri> pendUris;
+
     private void share(JSONObject o, String text, JSONArray fs, ArrayList<Uri> uris) {
         if (!text.isEmpty()) {
             ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
             if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("공지", text));
+            if (!uris.isEmpty()) { pendO = o; pendFs = fs; pendUris = uris; }
+            Intent t = new Intent(Intent.ACTION_SEND);
+            t.setType("text/plain");
+            t.putExtra(Intent.EXTRA_TEXT, text);
+            t.setPackage(KAKAO_PKG);
+            try { startActivity(t); } catch (Exception e) { pendUris = null; toast("카카오톡을 열 수 없어요. 카카오톡이 설치돼 있는지 확인해 주세요."); return; }
+            if (uris.isEmpty()) setStatus(o.optString("_id"), "shared");
+            else toast("1/2 문구를 먼저 보내요. 전송 후 이 앱으로 돌아오면 파일을 보낼 수 있어요");
+            return;
         }
+        sendFiles(o, fs, uris);
+    }
+
+    private void sendFiles(JSONObject o, JSONArray fs, ArrayList<Uri> uris) {
         Intent i;
-        if (uris.isEmpty()) {
-            i = new Intent(Intent.ACTION_SEND);
-            i.setType("text/plain");
-        } else if (uris.size() == 1) {
+        if (uris.size() == 1) {
             i = new Intent(Intent.ACTION_SEND);
             String mime = fs.optJSONObject(0) != null ? fs.optJSONObject(0).optString("mime", "*/*") : "*/*";
             i.setType(mime.isEmpty() ? "*/*" : mime);
@@ -572,17 +588,26 @@ public class MainActivity extends Activity {
             for (int k = 1; k < uris.size(); k++) cd.addItem(new ClipData.Item(uris.get(k)));
             i.setClipData(cd);
         }
-        if (!text.isEmpty()) i.putExtra(Intent.EXTRA_TEXT, text);
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         i.setPackage(KAKAO_PKG);
-        try {
-            startActivity(i);
-        } catch (Exception e) {
-            toast("카카오톡을 열 수 없어요. 카카오톡이 설치돼 있는지 확인해 주세요.");
-            return;
-        }
-        if (!uris.isEmpty() && !text.isEmpty()) toast("파일과 함께 문구가 안 보이면, 대화창을 길게 눌러 붙여넣기 하세요 (문구는 복사돼 있어요)");
+        try { startActivity(i); } catch (Exception e) { toast("카카오톡을 열 수 없어요."); return; }
         setStatus(o.optString("_id"), "shared");
+    }
+
+    /** 문구를 보내고 돌아오면: 같은 방에 파일도 보낼지 묻는다 (선생님이 눌러야만 진행). */
+    private void askPendingFiles() {
+        if (pendUris == null) return;
+        final JSONObject o = pendO; final JSONArray fs = pendFs; final ArrayList<Uri> u = pendUris;
+        pendO = null; pendFs = null; pendUris = null;
+        StringBuilder names = new StringBuilder();
+        for (int k = 0; k < fs.length(); k++) { JSONObject f = fs.optJSONObject(k); if (f != null) names.append("📎 ").append(f.optString("name")).append("\n"); }
+        new AlertDialog.Builder(this)
+                .setTitle("2/2 파일 보내기")
+                .setMessage("문구를 보낸 방에 이어서 파일을 보낼까요?\n\n" + names.toString().trim() + "\n\n카톡에서 같은 방을 다시 골라 전송을 눌러야 보내져요.")
+                .setPositiveButton("파일 보내기", (d, w) -> sendFiles(o, fs, u))
+                .setNegativeButton("나중에", (d, w) -> toast("파일은 아직 안 보냈어요. 항목을 다시 열어 보낼 수 있어요"))
+                .setCancelable(false)
+                .show();
     }
 
     private void setStatus(String id, String st) {
