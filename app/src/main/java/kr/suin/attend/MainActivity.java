@@ -6,6 +6,10 @@ import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.app.TimePickerDialog;
 import android.content.BroadcastReceiver;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.database.Cursor;
+import android.provider.OpenableColumns;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -127,6 +131,7 @@ public class MainActivity extends Activity {
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
         if (FirebaseAuth.getInstance().getCurrentUser() == null) showLogin();
         else startApp();
+        takeSharedIntent(getIntent());
 
         IntentFilter filter = new IntentFilter(ACTION_SENT);
         if (Build.VERSION.SDK_INT >= 33) {
@@ -358,12 +363,16 @@ public class MainActivity extends Activity {
         studentsBtn.setOnClickListener(v -> showStudents());
         Button tplBtn = button("문구", Color.WHITE, INK);
         tplBtn.setOnClickListener(v -> showTemplates());
+        Button kakaoBtn = button("카톡", 0xFFFEE500, 0xFF191919);
+        kakaoBtn.setOnClickListener(v -> showKakao());
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44));
         lp.leftMargin = dp(8);
         studentsBtn.setMinWidth(dp(64));
         tplBtn.setMinWidth(dp(64));
+        kakaoBtn.setMinWidth(dp(64));
         top.addView(studentsBtn, lp);
         top.addView(tplBtn, lp);
+        top.addView(kakaoBtn, lp);
         root.addView(top);
 
         // date bar
@@ -1188,6 +1197,158 @@ public class MainActivity extends Activity {
                 })
                 .setNegativeButton("취소", null)
                 .show();
+    }
+
+    // ------------------------------------------------------------------ kakao share
+
+    private static final int REQ_KAKAO_FILES = 7001;
+    private static final String KAKAO_PKG = "com.kakao.talk";
+    private final ArrayList<Uri> kakaoFiles = new ArrayList<>();
+    private TextView kakaoFileList;
+
+    private String fileName(Uri u) {
+        try (Cursor c = getContentResolver().query(u, null, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (i >= 0) return c.getString(i);
+            }
+        } catch (Exception ignored) { }
+        String l = u.getLastPathSegment();
+        return l == null ? "파일" : l;
+    }
+
+    private void refreshKakaoFiles() {
+        if (kakaoFileList == null) return;
+        if (kakaoFiles.isEmpty()) { kakaoFileList.setText("첨부한 파일 없음"); return; }
+        StringBuilder b = new StringBuilder();
+        for (Uri u : kakaoFiles) b.append("📎 ").append(fileName(u)).append("\n");
+        kakaoFileList.setText(b.toString().trim());
+    }
+
+    /** 공지 문구 + 파일을 카카오톡으로 넘긴다. 단톡방(또는 학부모)을 고르고 전송만 누르면 된다. 선생님 카톡 계정으로 간다. */
+    private void showKakao() {
+        LinearLayout v = new LinearLayout(this);
+        v.setOrientation(LinearLayout.VERTICAL);
+        v.setPadding(dp(20), dp(8), dp(20), 0);
+        v.addView(text("보내기를 누르면 카카오톡이 열려요. 보낼 단톡방이나 학부모를 고르고 전송만 누르면 돼요. 문구는 복사도 돼 있어서, 파일과 함께 문구가 안 붙으면 대화창에 붙여넣기만 하세요.", 13, MUTED, false));
+        TextView lab = text("보낼 문구", 13, INK, true);
+        lab.setPadding(0, dp(10), 0, 0);
+        v.addView(lab);
+        EditText msg = input("공지 내용을 입력하세요", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        msg.setMinLines(6);
+        msg.setGravity(Gravity.TOP | Gravity.START);
+        msg.setText(sp.getString("kakaoDraft", ""));
+        v.addView(msg);
+        kakaoFileList = text("", 13, INK, false);
+        kakaoFileList.setPadding(0, dp(10), 0, dp(4));
+        v.addView(kakaoFileList);
+        refreshKakaoFiles();
+        LinearLayout row = new LinearLayout(this);
+        Button add = button("파일 첨부", Color.WHITE, INK);
+        add.setOnClickListener(x -> {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            try { startActivityForResult(i, REQ_KAKAO_FILES); } catch (Exception e) { toast("파일을 고를 수 없어요"); }
+        });
+        Button clear = button("첨부 비우기", Color.WHITE, INK);
+        clear.setOnClickListener(x -> { kakaoFiles.clear(); refreshKakaoFiles(); });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44));
+        lp.rightMargin = dp(8);
+        row.addView(add, lp);
+        row.addView(clear, lp);
+        v.addView(row);
+        ScrollView sc = new ScrollView(this);
+        sc.addView(v);
+        new AlertDialog.Builder(this)
+                .setTitle("카톡으로 보내기")
+                .setView(sc)
+                .setPositiveButton("카톡 열기", (d, w) -> {
+                    String t = msg.getText().toString().trim();
+                    sp.edit().putString("kakaoDraft", t).apply();
+                    sendToKakao(t);
+                })
+                .setNeutralButton("문구 지우기", (d, w) -> { sp.edit().remove("kakaoDraft").apply(); kakaoFiles.clear(); toast("비웠어요"); })
+                .setNegativeButton("닫기", (d, w) -> sp.edit().putString("kakaoDraft", msg.getText().toString()).apply())
+                .show();
+    }
+
+    private void sendToKakao(String t) {
+        if (t.isEmpty() && kakaoFiles.isEmpty()) { toast("보낼 문구나 파일이 없어요"); return; }
+        if (!t.isEmpty()) {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("공지", t));
+        }
+        Intent i;
+        if (kakaoFiles.isEmpty()) {
+            i = new Intent(Intent.ACTION_SEND);
+            i.setType("text/plain");
+        } else if (kakaoFiles.size() == 1) {
+            i = new Intent(Intent.ACTION_SEND);
+            String type = getContentResolver().getType(kakaoFiles.get(0));
+            i.setType(type == null ? "*/*" : type);
+            i.putExtra(Intent.EXTRA_STREAM, kakaoFiles.get(0));
+            i.setClipData(ClipData.newRawUri("file", kakaoFiles.get(0)));
+        } else {
+            i = new Intent(Intent.ACTION_SEND_MULTIPLE);
+            i.setType("*/*");
+            i.putParcelableArrayListExtra(Intent.EXTRA_STREAM, new ArrayList<>(kakaoFiles));
+            ClipData cd = ClipData.newRawUri("file", kakaoFiles.get(0));
+            for (int k = 1; k < kakaoFiles.size(); k++) cd.addItem(new ClipData.Item(kakaoFiles.get(k)));
+            i.setClipData(cd);
+        }
+        if (!t.isEmpty()) i.putExtra(Intent.EXTRA_TEXT, t);
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        i.setPackage(KAKAO_PKG);
+        try {
+            startActivity(i);
+            if (!kakaoFiles.isEmpty() && !t.isEmpty()) toast("파일을 보낸 뒤 문구가 안 보이면 대화창을 길게 눌러 붙여넣기 하세요");
+        } catch (Exception e) {
+            i.setPackage(null);
+            try { startActivity(Intent.createChooser(i, "보낼 앱 고르기")); toast("카카오톡이 없어서 다른 앱 목록을 열었어요"); }
+            catch (Exception e2) { toast("보낼 수 있는 앱이 없어요"); }
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req != REQ_KAKAO_FILES || res != RESULT_OK || data == null) return;
+        ArrayList<Uri> got = new ArrayList<>();
+        if (data.getClipData() != null) for (int k = 0; k < data.getClipData().getItemCount(); k++) got.add(data.getClipData().getItemAt(k).getUri());
+        else if (data.getData() != null) got.add(data.getData());
+        for (Uri u : got) {
+            try { getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION); } catch (Exception ignored) { }
+            if (!kakaoFiles.contains(u)) kakaoFiles.add(u);
+        }
+        refreshKakaoFiles();
+    }
+
+    /** 다른 앱(Claude·파일 앱 등)에서 '공유 → 수인T 출결'로 넘어온 파일·문구를 카톡 보내기 창에 담는다. */
+    private void takeSharedIntent(Intent it) {
+        if (it == null) return;
+        String act = it.getAction();
+        if (!Intent.ACTION_SEND.equals(act) && !Intent.ACTION_SEND_MULTIPLE.equals(act)) return;
+        kakaoFiles.clear();
+        if (Intent.ACTION_SEND.equals(act)) {
+            Uri u = it.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (u != null) kakaoFiles.add(u);
+        } else {
+            ArrayList<Uri> us = it.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            if (us != null) kakaoFiles.addAll(us);
+        }
+        String t = it.getStringExtra(Intent.EXTRA_TEXT);
+        if (t != null && !t.trim().isEmpty()) sp.edit().putString("kakaoDraft", t.trim()).apply();
+        it.setAction(null);
+        ui.post(this::showKakao);
+    }
+
+    @Override
+    protected void onNewIntent(Intent it) {
+        super.onNewIntent(it);
+        setIntent(it);
+        takeSharedIntent(it);
     }
 
     private void toast(String s) {
