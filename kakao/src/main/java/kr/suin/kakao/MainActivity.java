@@ -563,8 +563,7 @@ public class MainActivity extends Activity {
             Intent t = new Intent(Intent.ACTION_SEND);
             t.setType("text/plain");
             t.putExtra(Intent.EXTRA_TEXT, text);
-            t.setPackage(KAKAO_PKG);
-            try { startActivity(t); } catch (Exception e) { pendUris = null; toast("카카오톡을 열 수 없어요. 카카오톡이 설치돼 있는지 확인해 주세요."); return; }
+            try { startActivity(Intent.createChooser(t, "1/2 문구 보내기 — 카카오톡 선택")); } catch (Exception e) { pendUris = null; toast("카카오톡을 열 수 없어요. 카카오톡이 설치돼 있는지 확인해 주세요."); return; }
             if (uris.isEmpty()) setStatus(o.optString("_id"), "shared");
             else toast("1/2 문구를 먼저 보내요. 전송 후 이 앱으로 돌아오면 파일을 보낼 수 있어요");
             return;
@@ -589,8 +588,9 @@ public class MainActivity extends Activity {
             i.setClipData(cd);
         }
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        i.setPackage(KAKAO_PKG);
-        try { startActivity(i); } catch (Exception e) { toast("카카오톡을 열 수 없어요."); return; }
+        Intent ch = Intent.createChooser(i, "2/2 파일 보내기 — 카카오톡 선택");
+        ch.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try { startActivity(ch); } catch (Exception e) { toast("공유 화면을 열 수 없어요."); return; }
         setStatus(o.optString("_id"), "shared");
     }
 
